@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent
 # Embeddable python311._pth may omit the script directory from sys.path; local modules live next to this file.
 sys.path.insert(0, str(ROOT))
 
+from transcribe_local import default_whisper_model_choice
+
 try:
     from browser_bilibili import parse_srt_to_lines
 except ImportError:
@@ -211,8 +213,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--whisper-model",
-        default="large-v3",
-        help="faster-whisper 模型（默认 large-v3；便携可与 GUI 一致选 small；其它见 faster-whisper 文档）",
+        default=default_whisper_model_choice(),
+        help="faster-whisper 模型（默认优先使用 whisper-models/ 中已存在的目录；离线勿选未拷贝的模型）",
     )
     ap.add_argument(
         "--whisper-device",

@@ -21,6 +21,26 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 WHISPER_MODEL_CHOICES: tuple[str, ...] = ("large-v3", "small")
 
 
+def is_offline_mode() -> bool:
+    """若设置 BILIBILI_OFFLINE=1（或 true/yes），禁止访问 Hugging Face 下载模型与 static-ffmpeg 拉取。"""
+    v = (os.environ.get("BILIBILI_OFFLINE") or "").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _bundled_model_bin(model_size: str) -> Path:
+    return _PROJECT_ROOT / "whisper-models" / model_size / "model.bin"
+
+
+def default_whisper_model_choice() -> str:
+    """
+    优先使用已随包放入 whisper-models/ 的模型，避免仅带 small 时仍默认 large-v3 导致联网下载。
+    """
+    for name in WHISPER_MODEL_CHOICES:
+        if _bundled_model_bin(name).is_file():
+            return name
+    return WHISPER_MODEL_CHOICES[0]
+
+
 def resolve_whisper_model_path(model_size: str, explicit: str | None) -> str | None:
     """
     显式 --whisper-model-path > 环境变量 WHISPER_MODEL_PATH >
@@ -33,7 +53,7 @@ def resolve_whisper_model_path(model_size: str, explicit: str | None) -> str | N
     if env:
         return str(Path(env).expanduser().resolve())
     bundled = _PROJECT_ROOT / "whisper-models" / model_size
-    if bundled.is_dir() and (bundled / "model.bin").is_file():
+    if bundled.is_dir() and _bundled_model_bin(model_size).is_file():
         print(f"使用内置 Whisper 模型目录：{bundled}", flush=True)
         return str(bundled.resolve())
     return None
@@ -80,6 +100,8 @@ def _project_bundled_ffmpeg_dir() -> str | None:
 
 def _try_static_ffmpeg_download() -> str | None:
     """通过 static-ffmpeg 从网络拉取二进制；失败时重试（GitHub 在国内常不稳定）。"""
+    if is_offline_mode():
+        return None
     try:
         import static_ffmpeg
     except ImportError:
@@ -490,7 +512,14 @@ def transcribe_audio_file(
             raise FileNotFoundError(f"本地模型目录不存在：{mp}")
         if not (mp / "model.bin").is_file():
             raise FileNotFoundError(f"本地模型目录缺少 model.bin：{mp}")
+        # 已使用本地目录时禁止 Hub 再联网（公司内网 / 离线机避免卡住或误连外网）
+        os.environ["HF_HUB_OFFLINE"] = "1"
     else:
+        if is_offline_mode():
+            raise RuntimeError(
+                f"离线模式（已设置 BILIBILI_OFFLINE）：未找到本地模型 whisper-models/{model_size}/model.bin。\n"
+                "请拷贝对应模型目录，或在 GUI/命令行改用已存在的模型（如 small），或使用 START_OFFLINE.bat 前确认已选本地有的模型。"
+            )
         print(
             f"未找到本地 whisper-models/{model_size}，将从 Hugging Face 首次下载（需联网；"
             f"打包时带上 whisper-models 可免此步）。",

@@ -32,6 +32,7 @@ from browser_bilibili import (  # noqa: E402
     ensure_cookies_from_state,
     save_login_state,
 )
+from transcribe_local import default_whisper_model_choice  # noqa: E402
 
 
 def run(cmd: list[str]) -> None:
@@ -87,7 +88,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         extras.extend(
             [
                 "--whisper-model",
-                getattr(args, "whisper_model", "large-v3"),
+                getattr(args, "whisper_model", default_whisper_model_choice()),
                 "--whisper-device",
                 getattr(args, "whisper_device", "auto"),
             ]
@@ -163,8 +164,8 @@ def main() -> None:
     )
     p_ex.add_argument(
         "--whisper-model",
-        default="large-v3",
-        help="faster-whisper 模型（默认 large-v3；便携预置可与 GUI 一致选 small）",
+        default=default_whisper_model_choice(),
+        help="faster-whisper 模型（默认优先使用 whisper-models/ 中已存在的目录，如仅 small 则默认 small）",
     )
     p_ex.add_argument(
         "--whisper-device",

@@ -114,6 +114,8 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
    `.\python_embed\python.exe -m pip install -r requirements-gpu.txt`
 4. 双击 **`START.bat`** 或 **`启动.bat`** 打开 GUI。首次使用 B 站功能时按提示在 Chromium 中登录。
 
+**公司内网 / 无外网（仅本机音视频转写）**：把整个便携目录拷过去（须含 `python_embed/`、你要用的 **`whisper-models/<模型名>/`**、`ffmpeg/` 下的 `ffmpeg.exe` 与 `ffprobe.exe`）。在公司电脑双击 **`START_OFFLINE.bat`**（会设置 `BILIBILI_OFFLINE` / `HF_HUB_OFFLINE`，避免误连外网下载模型或 static-ffmpeg）。Whisper 下拉框会**默认选中 `whisper-models/` 里已存在**的模型（例如压缩包只带了 `small` 时默认就是 `small`）。请用「浏览」选本地 mp3/mp4 等路径；**B 站链接**仍依赖外网拉流，离线环境无法使用。
+
 **跳过 Whisper 预下载**（加快首次脚本时间）：
 
 ```powershell
@@ -240,6 +242,6 @@ powershell -ExecutionPolicy Bypass -File ".\一键推送GitHub.ps1"
 
 **Bilibili Transcript One-Click** is a Windows-oriented toolkit: fetch Bilibili subtitles and danmaku (with optional Playwright login), merge transcripts, optionally run **faster-whisper** when no subtitles exist, then optionally call **Gemini / OpenAI / Groq / Anthropic / xAI** for a structured report and follow-up chat in the GUI.
 
-Large binaries (`python_embed`, `pw-browsers`, Whisper weights, optional `ffmpeg` exes) are **not** in Git; run `准备便携环境.ps1` to bootstrap. Use `START.bat` to launch the UI.
+Large binaries (`python_embed`, `pw-browsers`, Whisper weights, optional `ffmpeg` exes) are **not** in Git; run `准备便携环境.ps1` to bootstrap. Use `START.bat` to launch the UI. For **air-gapped** local-file transcription only, copy a full portable tree (embed + `whisper-models/<model>` + `ffmpeg/` exes) and run **`START_OFFLINE.bat`**; the UI defaults to whichever bundled model folder exists (e.g. `small` if `large-v3` was not copied). Bilibili URLs still need network access.
 
 **Related projects**: see the [table above](#related) — tools like [bili2text](https://github.com/lanbinleo/bili2text) focus on transcription pipelines; this repo adds merged danmaku/subtitle workflow, portable embed layout, and integrated LLM report + chat.

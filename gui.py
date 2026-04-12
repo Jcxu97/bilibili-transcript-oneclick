@@ -27,6 +27,7 @@ from llm_analyze import chat_followup, resolve_provider
 from transcribe_local import (
     SUPPORTED_LOCAL_MEDIA_SUFFIXES,
     WHISPER_MODEL_CHOICES,
+    default_whisper_model_choice,
     is_supported_local_media,
 )
 
@@ -324,7 +325,7 @@ def run_pipeline(
     on_done,
     *,
     asr_if_no_subs: bool = False,
-    whisper_model: str = "large-v3",
+    whisper_model: str | None = None,
     llm_provider: str = "auto",
 ) -> None:
     env = os.environ.copy()
@@ -342,9 +343,9 @@ def run_pipeline(
             ]
             if asr_if_no_subs:
                 cmd.append("--asr-if-no-subs")
-            wm = (whisper_model or "large-v3").strip()
+            wm = (whisper_model or default_whisper_model_choice()).strip()
             if wm not in WHISPER_MODEL_CHOICES:
-                wm = "large-v3"
+                wm = default_whisper_model_choice()
             cmd.extend(["--whisper-model", wm])
             cmd.append(url.strip())
             proc = subprocess.Popen(
@@ -576,7 +577,7 @@ class App(tk.Tk):
         model_row = ttk.Frame(card)
         model_row.pack(fill=tk.X, pady=(0, inner))
         ttk.Label(model_row, text="本地 Whisper 模型").pack(side=tk.LEFT, padx=(0, 8))
-        self.whisper_model_var = tk.StringVar(value=WHISPER_MODEL_CHOICES[0])
+        self.whisper_model_var = tk.StringVar(value=default_whisper_model_choice())
         self.whisper_combo = ttk.Combobox(
             model_row,
             textvariable=self.whisper_model_var,
@@ -1361,7 +1362,7 @@ class App(tk.Tk):
 
         wm = self.whisper_model_var.get().strip()
         if wm not in WHISPER_MODEL_CHOICES:
-            wm = WHISPER_MODEL_CHOICES[0]
+            wm = default_whisper_model_choice()
         self._sync_llm_env_from_form()
         self.agent_session._provider = resolve_provider(self.llm_provider_var.get().strip())
         lp = self.llm_provider_var.get().strip() or "auto"
