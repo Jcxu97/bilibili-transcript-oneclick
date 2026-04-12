@@ -64,24 +64,38 @@ python_embed\python.exe bilibili_pipeline.py extract "https://www.bilibili.com/v
 python_embed\python.exe bilibili_pipeline.py extract --asr-if-no-subs --whisper-model small "https://..."
 ```
 
-## 推送到 GitHub（在你本机执行）
+## 推送到 GitHub
+
+本仓库已包含 `.gitignore`（忽略密钥、`python_embed/`、浏览器与模型等大目录）、GitHub Actions（`.github/workflows/ci.yml`）与 `SECURITY.md`。
+
+### 方式 A：一键脚本（推荐）
+
+1. 安装 **Git** 与 **GitHub CLI**：`winget install Git.Git`、`winget install GitHub.cli`
+2. 在本目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\一键推送GitHub.ps1"
+```
+
+按提示浏览器登录 GitHub，脚本会创建**公开**仓库并推送 `main`。
+
+### 方式 B：手动
 
 1. 安装 [Git for Windows](https://git-scm.com/download/win)。
 2. 在 GitHub 网页 **New repository** 建空仓库（不要勾选自动添加 README）。
-3. 在本目录打开终端：
+3. 若尚未初始化：`git init` 且 `git checkout -b main`，再 `git add .` / `git commit`。
+4. 添加远程并推送：
 
 ```bash
-git init
-git checkout -b main
-git add .
-git commit -m "Initial commit: Bilibili transcript / ASR / analysis toolkit"
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
 ```
 
 若使用 SSH：`git remote add origin git@github.com:<用户>/<仓库>.git`
 
-**注意**：勿将 `local_api_keys.py`、`cookies.txt` 提交进仓库（已在 `.gitignore`）。
+**注意**：勿将 `local_api_keys.py`、`cookies.txt` 等提交进仓库（已在 `.gitignore`）。
+
+**说明**：在 Cursor 里看到的 `SHA256:…` 多为 **github.com 的 SSH 主机密钥指纹**，用于核对身份，**不是**可用来登录的令牌；登录请用 `gh auth login` 或 GitHub 网页 **Personal access token**。
 
 ## 许可证
 
