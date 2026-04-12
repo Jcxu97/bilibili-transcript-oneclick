@@ -10,6 +10,22 @@
 - **无字幕转写**：yt-dlp 下音频 + faster-whisper；GUI 可选模型 **large-v3** / **small**
 - **FFmpeg**：优先 `ffmpeg/` 目录、PATH，其次 static-ffmpeg（可能访问 GitHub）
 
+## 界面预览
+
+便携环境就绪后，双击 `START.bat` / `启动.bat` 启动 GUI，主要页面如下。
+
+**提取与日志**（B 站链接或本地音视频、Whisper 模型、运行日志）
+
+![提取与日志界面](docs/screenshots/gui-extract.png)
+
+**API 与模型**（各平台 Key、首选提供商、应用/保存）
+
+![API 与模型界面](docs/screenshots/gui-api-models.png)
+
+**分析报告与底部对话**（结构化报告 + 基于文稿的多轮问答，示例为 xAI Grok）
+
+![分析报告与对话界面](docs/screenshots/gui-analysis-chat.png)
+
 ## 环境要求
 
 - **Windows 10/11 x64**
