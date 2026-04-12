@@ -3,7 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File ".\一键推送GitHub.ps1"
 #
 # Steps: gh auth login (browser) -> gh repo create -> push main
-# Note: User-visible messages are ASCII-only so Windows PowerShell 5.1 -File works without UTF-8 BOM issues.
+# User-visible messages are ASCII-only (Windows PowerShell 5.1 -File encoding safe).
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
@@ -25,26 +25,58 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host ">>> Step 1/3: GitHub login (browser will open)" -ForegroundColor Cyan
+Write-Host "    If login fails (TLS timeout), fix VPN/proxy/firewall, then run this script again." -ForegroundColor DarkGray
 & gh auth login -h github.com -p https -w
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "ERROR: gh auth login failed. You are not logged in. Fix network, then re-run this script." -ForegroundColor Red
+    exit 1
+}
+
+$ErrorActionPreference = "SilentlyContinue"
+$null = gh auth status 2>&1
+$ErrorActionPreference = "Stop"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "ERROR: Still not authenticated. Run: gh auth login -h github.com -p https -w" -ForegroundColor Red
+    exit 1
+}
 
 Write-Host ""
-Write-Host ">>> Step 2/3: New repository name [Enter = default]" -ForegroundColor Cyan
+Write-Host ">>> Step 2/3: New repository name" -ForegroundColor Cyan
+Write-Host "    Press Enter for default. Do NOT type y/n here (that was only for the previous question)." -ForegroundColor DarkGray
 $defaultName = "bilibili-transcript-oneclick"
 $repoName = Read-Host "Repo name [$defaultName]"
-if ([string]::IsNullOrWhiteSpace($repoName)) { $repoName = $defaultName }
+if ([string]::IsNullOrWhiteSpace($repoName)) {
+    $repoName = $defaultName
+} elseif ($repoName -match '^(?i)(y|n|yes|no)$') {
+    Write-Host "    Ignoring '$repoName' (looks like y/n). Using default: $defaultName" -ForegroundColor Yellow
+    $repoName = $defaultName
+}
 
 Write-Host ""
 Write-Host ">>> Step 3/3: Create public repo and push branch main" -ForegroundColor Cyan
-if (& git remote get-url origin 2>$null) {
+
+# Do not use: if (& git remote get-url origin) — stderr breaks under $ErrorActionPreference Stop
+$ErrorActionPreference = "SilentlyContinue"
+git remote get-url origin 2>&1 | Out-Null
+$hasOrigin = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+
+if ($hasOrigin) {
     Write-Host "Remote origin exists; pushing only."
     & git push -u origin main
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {
     & gh repo create $repoName --public --source . --remote origin --push
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 Write-Host ""
 $login = ""
-try { $login = (& gh api user --jq .login 2>$null) } catch { }
+$ErrorActionPreference = "SilentlyContinue"
+try { $login = (& gh api user --jq .login 2>&1 | Out-String).Trim() } catch { }
+$ErrorActionPreference = "Stop"
 if ($login) {
     Write-Host "Done: https://github.com/$login/$repoName" -ForegroundColor Green
 } else {
