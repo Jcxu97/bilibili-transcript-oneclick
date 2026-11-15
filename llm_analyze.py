@@ -24,6 +24,9 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+import base64
+import mimetypes
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +34,88 @@ from typing import Literal
 MAX_MERGED_CHARS = 100_000
 # 仅用于底部多轮对话（非首屏分析报告）；略提高温度，回答更自然
 CHAT_TEMPERATURE = 0.65
+
+# 「报告与对话」附带 video_analysis_deep.json 中截取的代表帧：默认开启；设 CHAT_ATTACH_VISION_FRAMES=0 关闭
+# CHAT_VISION_MAX_FRAMES 默认 20（上限 32）
+
+
+def _env_bool_chat_attach_vision(default: bool = True) -> bool:
+    raw = os.environ.get("CHAT_ATTACH_VISION_FRAMES", "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
+def collect_timeline_frame_paths(json_path: Path) -> list[Path]:
+    """
+    从 video_analysis_deep.json 的 timeline 收集代表帧磁盘路径（去重、按时间轴顺序）。
+    用于「报告与对话」向多模态模型附带真实 JPEG，而非仅 OCR/VLM 文本摘要。
+    """
+    if not _env_bool_chat_attach_vision():
+        return []
+    if not json_path.is_file():
+        return []
+    raw_max = os.environ.get("CHAT_VISION_MAX_FRAMES", "").strip()
+    try:
+        max_frames = int(raw_max) if raw_max.isdigit() else 20
+    except ValueError:
+        max_frames = 20
+    max_frames = max(1, min(max_frames, 32))
+    max_bytes = 12 * 1024 * 1024
+    try:
+        jd = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(jd, dict):
+        return []
+    tl = jd.get("timeline")
+    if not isinstance(tl, list):
+        return []
+    seen: set[str] = set()
+    out: list[Path] = []
+    for ev in tl:
+        if not isinstance(ev, dict):
+            continue
+        ps = ev.get("path")
+        if not isinstance(ps, str) or not ps.strip():
+            continue
+        p = Path(ps).expanduser()
+        try:
+            p = p.resolve()
+        except OSError:
+            continue
+        if not p.is_file():
+            continue
+        try:
+            if p.stat().st_size > max_bytes:
+                continue
+        except OSError:
+            continue
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+        if len(out) >= max_frames:
+            break
+    return out
+
+
+def normalize_chat_prior_turns(
+    prior_turns: Sequence[tuple[str, str] | tuple[str, str, bool]],
+) -> list[tuple[str, str, bool]]:
+    """统一为 (用户原文, 助手回复, 该轮是否附带画面帧)。"""
+    out: list[tuple[str, str, bool]] = []
+    for t in prior_turns:
+        if len(t) == 3:
+            out.append((t[0], t[1], bool(t[2])))
+        else:
+            out.append((t[0], t[1], False))
+    return out
 
 
 def _load_local_api_keys() -> None:
@@ -119,6 +204,33 @@ def _user_prompt(merged: str, truncated: bool) -> str:
     )
 
 
+def _friendly_urlopen_err(url: str, err: BaseException) -> str:
+    """常见本机连接失败（如未启动本地 serve）时给出可操作说明。"""
+    r = getattr(err, "reason", err)
+    win = getattr(r, "winerror", None)
+    errno = getattr(r, "errno", None)
+    if win == 10061 or errno in (10061, 111):
+        port_hint = ""
+        if ":1234" in url:
+            port_hint = (
+                "\n\n（你当前 URL 使用 1234 端口，多为 LM Studio；若实际启动的是本项目 Gemma，"
+                "应改为 http://127.0.0.1:18090/v1 并运行 SERVE_GEMMA4_4BIT.bat。）"
+            )
+        return (
+            "无法连接该地址：本机拒绝连接（没有程序在监听该端口，WinError 10061）。\n"
+            "请先在本机启动 OpenAI 兼容服务，并把「本地对话」里的服务 URL 改成正在监听的地址（须含 /v1）。\n"
+            "· 本项目 Gemma 4-bit：运行 bilibili-transcript-oneclick-vision 目录下 SERVE_GEMMA4_4BIT.bat，"
+            "URL 填 http://127.0.0.1:18090/v1 ，模型 gemma-4-31b-4bit。\n"
+            "· 其它：Ollama 多为 http://127.0.0.1:11434/v1 ；LM Studio 常见 http://127.0.0.1:1234/v1（以软件显示为准）。\n"
+            f"本次请求：{url}"
+            + port_hint
+        )
+    low = str(err).lower()
+    if "timed out" in low or "timeout" in low:
+        return f"连接超时：{url}"
+    return f"{err}\n请求：{url}"
+
+
 def _http_post_json(url: str, payload: dict, headers: dict | None, timeout: int = 120) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     h = {"Content-Type": "application/json; charset=utf-8"}
@@ -126,8 +238,111 @@ def _http_post_json(url: str, payload: dict, headers: dict | None, timeout: int 
         h.update(headers)
     req = urllib.request.Request(url, data=data, headers=h, method="POST")
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with _urlopen_request(req, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        snippet = body or str(e)
+        if len(snippet) > 2400:
+            snippet = snippet[:2400] + "…"
+        extra = ""
+        if (
+            e.code == 422
+            and _url_is_loopback(url)
+            and '"query"' in snippet
+            and '"request"' in snippet
+        ):
+            extra = (
+                "\n\n[说明] 该 422 表示当前 URL 对应的 /v1/chat/completions 不是「JSON body」式 OpenAI 接口，"
+                "而是要求 URL 查询参数 request 的其它服务（与浏览器里 /health 看到的内容可能来自不同程序）。\n"
+                "请 netstat -ano | findstr :<你的端口> 查 PID，结束误占端口的进程；"
+                "或改用本项目新版默认端口：SERVE_GEMMA4_4BIT.bat（默认 18090），"
+                "并把「本地对话」服务 URL 改为 http://127.0.0.1:18090/v1 。"
+            )
+        raise RuntimeError(f"HTTP {e.code} {e.reason}\n{snippet}\n请求：{url}{extra}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(_friendly_urlopen_err(url, e)) from e
+
+
+def _http_post_openai_chat_sse_deltas(
+    url: str,
+    payload: dict,
+    headers: dict[str, str] | None,
+    timeout: int = 240,
+    *,
+    on_delta: Callable[[str], None] | None = None,
+) -> str:
+    """POST chat/completions（stream:true），聚合正文并可选回调每个文本增量。"""
+    pl = dict(payload)
+    pl["stream"] = True
+    data = json.dumps(pl, ensure_ascii=False).encode("utf-8")
+    h = {"Content-Type": "application/json; charset=utf-8"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method="POST")
+    ctx = ssl.create_default_context()
+    buf = b""
+    parts: list[str] = []
+    try:
+        with _urlopen_request(req, timeout=timeout, context=ctx) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            if status != 200:
+                body = resp.read().decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"HTTP {status}\n{body[:2400]}\n请求：{url}")
+            while True:
+                raw = resp.read(4096)
+                if not raw:
+                    break
+                buf += raw
+                while True:
+                    pos = buf.find(b"\n")
+                    if pos < 0:
+                        break
+                    line = buf[:pos]
+                    buf = buf[pos + 1 :]
+                    s = line.decode("utf-8", errors="replace").strip()
+                    if not s or s.startswith(":"):
+                        continue
+                    if not s.startswith("data:"):
+                        continue
+                    data_s = s[5:].strip()
+                    if data_s == "[DONE]":
+                        return "".join(parts).strip()
+                    try:
+                        obj = json.loads(data_s)
+                    except json.JSONDecodeError:
+                        continue
+                    err = obj.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        raise RuntimeError(str(err.get("message")))
+                    for ch in obj.get("choices") or []:
+                        if not isinstance(ch, dict):
+                            continue
+                        delta = ch.get("delta") or {}
+                        if not isinstance(delta, dict):
+                            continue
+                        c = delta.get("content")
+                        if c:
+                            t = str(c)
+                            parts.append(t)
+                            if on_delta is not None:
+                                on_delta(t)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        snippet = body or str(e)
+        if len(snippet) > 2400:
+            snippet = snippet[:2400] + "…"
+        raise RuntimeError(f"HTTP {e.code} {e.reason}\n{snippet}\n请求：{url}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(_friendly_urlopen_err(url, e)) from e
+    return "".join(parts).strip()
 
 
 def _gemini_default_models() -> tuple[str, ...]:
@@ -200,21 +415,50 @@ def _gemini_generate(api_key: str, system: str, user: str) -> tuple[str, str]:
     raise RuntimeError("Gemini 调用失败：" + (last_err or "unknown"))
 
 
+def _gemini_inline_user_parts(text: str, images: list[Path]) -> list[dict]:
+    parts: list[dict] = []
+    t = (text or "").strip()
+    if t:
+        parts.append({"text": t})
+    for p in images:
+        try:
+            if not p.is_file():
+                continue
+            raw = p.read_bytes()
+            if len(raw) > 15 * 1024 * 1024:
+                continue
+            b64 = base64.standard_b64encode(raw).decode("ascii")
+            mime = _guess_image_mime(p)
+            parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+        except OSError:
+            continue
+    if not parts:
+        parts.append({"text": (text or "").strip() or "."})
+    return parts
+
+
 def _gemini_multiturn(
     api_key: str,
     system: str,
-    prior_turns: list[tuple[str, str]],
+    prior_turns: list[tuple[str, str, bool]],
     user_payload: str,
+    *,
+    attach_vision_current: bool,
+    vision_paths: list[Path] | None = None,
 ) -> tuple[str, str]:
-    """prior_turns: (user_text, model_text) 按时间顺序；user_payload 为本轮用户输入。"""
+    """prior 每项 (user, model, 该轮是否附图)；仅当对应标志为真时把 vision_paths 附在该轮 user 上。"""
+    imgs0 = list(vision_paths or [])
     contents: list[dict] = []
-    for u, a in prior_turns:
-        contents.append({"role": "user", "parts": [{"text": u}]})
+    for u, a, att in prior_turns:
+        u_imgs = imgs0 if att else []
+        contents.append({"role": "user", "parts": _gemini_inline_user_parts(u, u_imgs)})
         contents.append({"role": "model", "parts": [{"text": a}]})
-    contents.append({"role": "user", "parts": [{"text": user_payload}]})
+    last_imgs = imgs0 if attach_vision_current else []
+    contents.append({"role": "user", "parts": _gemini_inline_user_parts(user_payload, last_imgs)})
 
     models_try = _gemini_default_models()
     last_err: str | None = None
+    need_slow = bool(imgs0) and (attach_vision_current or any(t[2] for t in prior_turns))
     for api_ver in ("v1beta", "v1"):
         for model in models_try:
             url = (
@@ -230,7 +474,8 @@ def _gemini_multiturn(
                 },
             }
             try:
-                out = _http_post_json(url, payload, None, timeout=120)
+                to = 300 if need_slow else 120
+                out = _http_post_json(url, payload, None, timeout=to)
             except urllib.error.HTTPError as e:
                 try:
                     body = e.read().decode("utf-8", errors="replace")
@@ -283,35 +528,23 @@ def _groq_chat(api_key: str, system: str, user: str) -> tuple[str, str]:
 def _groq_multiturn(
     api_key: str,
     system: str,
-    prior_turns: list[tuple[str, str]],
+    prior_turns: list[tuple[str, str, bool]],
     user_payload: str,
+    *,
+    attach_vision_current: bool,
+    vision_paths: list[Path] | None = None,
 ) -> tuple[str, str]:
     model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    messages: list[dict] = [{"role": "system", "content": system}]
-    for u, a in prior_turns:
-        messages.append({"role": "user", "content": u})
-        messages.append({"role": "assistant", "content": a})
-    messages.append({"role": "user", "content": user_payload})
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": CHAT_TEMPERATURE,
-        "max_tokens": 8192,
-    }
-    headers = {"Authorization": f"Bearer {api_key}"}
-    try:
-        out = _http_post_json(url, payload, headers, timeout=120)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Groq HTTP {e.code}: {body[:1200]}") from e
-    try:
-        text = out["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Groq 解析失败: {e!s}") from e
-    if not text:
-        raise RuntimeError("Groq 返回空正文")
-    return text, model
+    return _openai_compatible_multiturn(
+        api_key,
+        "https://api.groq.com/openai/v1",
+        model,
+        system,
+        prior_turns,
+        user_payload,
+        attach_vision_current=attach_vision_current,
+        vision_paths=vision_paths,
+    )
 
 
 def _openai_compatible_chat(
@@ -347,15 +580,30 @@ def _openai_compatible_multiturn(
     base_url: str,
     model: str,
     system: str,
-    prior_turns: list[tuple[str, str]],
+    prior_turns: list[tuple[str, str, bool]],
     user_payload: str,
+    *,
+    attach_vision_current: bool,
+    vision_paths: list[Path] | None = None,
 ) -> tuple[str, str]:
+    """OpenAI 兼容多轮；仅在 prior 各轮或当前轮标志为真时附 vision_paths。"""
     url = base_url.rstrip("/") + "/chat/completions"
+    imgs0 = list(vision_paths or [])
     messages: list[dict] = [{"role": "system", "content": system}]
-    for u, a in prior_turns:
-        messages.append({"role": "user", "content": u})
+    for u, a, att in prior_turns:
+        uimgs = imgs0 if att else []
+        try:
+            ucontent = _openai_user_content_parts(u, uimgs)
+        except ValueError:
+            ucontent = (u or "").strip() or "."
+        messages.append({"role": "user", "content": ucontent})
         messages.append({"role": "assistant", "content": a})
-    messages.append({"role": "user", "content": user_payload})
+    last_imgs = imgs0 if attach_vision_current else []
+    try:
+        ucontent = _openai_user_content_parts(user_payload, last_imgs)
+    except ValueError:
+        ucontent = (user_payload or "").strip() or "."
+    messages.append({"role": "user", "content": ucontent})
     payload = {
         "model": model,
         "messages": messages,
@@ -363,13 +611,286 @@ def _openai_compatible_multiturn(
         "max_tokens": 8192,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
+    to = 120
+    if imgs0 and (attach_vision_current or any(t[2] for t in prior_turns)):
+        to = max(to, 300)
     try:
-        out = _http_post_json(url, payload, headers, timeout=120)
+        out = _http_post_json(url, payload, headers, timeout=to)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OpenAI-compatible HTTP {e.code}: {body[:1200]}") from e
     try:
-        text = out["choices"][0]["message"]["content"].strip()
+        raw = out["choices"][0]["message"]["content"]
+        text = _parse_assistant_openai_content(raw)
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"OpenAI-compatible 解析失败: {e!s}") from e
+    if not text:
+        raise RuntimeError("OpenAI-compatible 返回空正文")
+    return text, model
+
+
+SYSTEM_LOCAL_CHAT_ZH = (
+    "你是乐于助人的助手，默认用简体中文、自然口语化回答。"
+    "需要时分条说明即可，不必使用 Markdown 标题或星号加粗。"
+)
+
+MAX_LOCAL_CHAT_MERGED_SNIPPET = 48_000
+
+
+def _guess_image_mime(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(path.name)
+    return mime or "image/png"
+
+
+def _openai_user_content_parts(text: str, image_paths: list[Path]) -> str | list:
+    """构造 OpenAI 兼容的 user content（纯文或 text+image_url 数组）。"""
+    parts: list[dict] = []
+    t = (text or "").strip()
+    if t:
+        parts.append({"type": "text", "text": t})
+    for p in image_paths:
+        try:
+            if not p.is_file():
+                continue
+            raw = p.read_bytes()
+            if len(raw) > 15 * 1024 * 1024:
+                raise RuntimeError(
+                    f"单张图片过大（{len(raw) // 1024 // 1024}MB），请压缩后重试：{p.name}"
+                )
+            b64 = base64.standard_b64encode(raw).decode("ascii")
+            mime = _guess_image_mime(p)
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                }
+            )
+        except OSError as e:
+            raise RuntimeError(f"无法读取图片 {p.name}：{e}") from e
+    if not parts:
+        raise ValueError("请输入文字或添加至少一张图片。")
+    if len(parts) == 1 and parts[0]["type"] == "text":
+        return parts[0]["text"]
+    if not t:
+        parts.insert(0, {"type": "text", "text": "请描述或分析这些图片。"})
+    return parts
+
+
+def _parse_assistant_openai_content(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                chunks.append(str(block.get("text") or ""))
+        return "".join(chunks).strip()
+    return (str(content) if content is not None else "").strip()
+
+
+def _host_is_loopback(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    h = hostname.strip().lower()
+    return h in ("127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1")
+
+
+def _url_is_loopback(url: str) -> bool:
+    try:
+        pu = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    return _host_is_loopback(pu.hostname)
+
+
+def _urlopen_request(
+    req: urllib.request.Request, *, timeout: int, context: ssl.SSLContext | None = None
+):
+    """对本机地址强制不走 HTTP(S)_PROXY，避免「浏览器 /health 正常、GUI POST 打到代理或其它服务」。"""
+    full = req.full_url
+    if _url_is_loopback(full):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(req, timeout=timeout)
+    ctx = context if context is not None else ssl.create_default_context()
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+
+def _http_get_json(url: str, *, timeout: int = 4) -> dict | None:
+    try:
+        req = urllib.request.Request(url, method="GET")
+        ctx = ssl.create_default_context()
+        with _urlopen_request(req, timeout=timeout, context=ctx) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+            return out if isinstance(out, dict) else None
+    except Exception:
+        return None
+
+
+def _normalize_openai_v1_base(base_url: str) -> str:
+    """本机 OpenAI 兼容根 URL 须以 /v1 结尾；若只填到端口则自动补 /v1（避免 POST 到错误路径）。"""
+    b = (base_url or "").strip().rstrip("/")
+    if not b:
+        return b
+    low = b.lower()
+    if ("127.0.0.1" in low or "localhost" in low) and not b.endswith("/v1"):
+        b = b + "/v1"
+    return b
+
+
+_GEMMA_LOCAL_HEALTH_SERVICE = "serve_gemma4_4bit"
+
+
+def _health_json_looks_like_serve_gemma(h: dict) -> bool:
+    """serve_gemma4_4bit 的 /health 为 {\"status\":\"ok\",\"model\":str,...}；用于区分 Ollama 等无此形态的本地服务。"""
+    if str(h.get("status", "")).lower() != "ok":
+        return False
+    m = h.get("model")
+    return isinstance(m, str)
+
+
+def _openapi_post_requires_query_request(spec: dict) -> bool:
+    """非 OpenAI 兼容的 FastAPI 常见在 POST /v1/chat/completions 上声明 query.request，导致 422。"""
+    paths = spec.get("paths")
+    if not isinstance(paths, dict):
+        return False
+    for path_key in ("/v1/chat/completions", "/v1/chat/completions/"):
+        node = paths.get(path_key)
+        if not isinstance(node, dict):
+            continue
+        post = node.get("post")
+        if not isinstance(post, dict):
+            continue
+        params = post.get("parameters")
+        if not isinstance(params, list):
+            continue
+        for p in params:
+            if isinstance(p, dict) and p.get("in") == "query" and str(p.get("name", "")) == "request":
+                return True
+    return False
+
+
+def _assert_loopback_serve_gemma_preflight(
+    chat_completions_url: str, *, client_model: str = ""
+) -> None:
+    """
+    仅当本机 /health 呈 serve_gemma4_4bit 形态时做校验（不误伤 Ollama 等）。
+    不绑定固定端口号：8090 常被其它软件占用，浏览器看到的 /health 可能与 POST 实际打到的程序不一致。
+    """
+    try:
+        pu = urllib.parse.urlparse(chat_completions_url)
+    except ValueError:
+        return
+    if not _host_is_loopback(pu.hostname):
+        return
+    if not (pu.path or "").rstrip("/").endswith("/v1/chat/completions"):
+        return
+    root = f"{pu.scheme}://{pu.netloc}"
+    port_hint = str(pu.port) if pu.port else "(默认端口)"
+    health_url = root + "/health"
+    h = _http_get_json(health_url, timeout=3)
+    if h is None or not _health_json_looks_like_serve_gemma(h):
+        return
+    if str(h.get("status", "")).lower() != "ok":
+        raise RuntimeError(
+            "本地 Gemma 自检：GET "
+            + health_url
+            + ' 的 JSON 中 status 须为 "ok"。\n摘要：'
+            + json.dumps(h, ensure_ascii=False)[:800]
+        )
+    want = (client_model or "").strip()
+    got = str(h.get("model", "")).strip()
+    if h.get("service") == _GEMMA_LOCAL_HEALTH_SERVICE:
+        pass
+    elif want and got == want:
+        pass
+    else:
+        raise RuntimeError(
+            "本地 Gemma 自检：GET "
+            + health_url
+            + " 未带 "
+            + f'"{_GEMMA_LOCAL_HEALTH_SERVICE}" 的 service 指纹（建议重启为新版 serve），'
+            + "且 health.model 与「本地对话」中的模型 ID 不一致。\n"
+            f'当前 health.model={got!r}，界面 model={want!r}。\n'
+            "若 POST 仍出现 422（query、request），多半是端口 "
+            + port_hint
+            + " 上混入了其它 HTTP 服务；请 netstat 查 PID，"
+            "或改用本项目默认端口 18090 启动 SERVE_GEMMA4_4BIT.bat。\n摘要："
+            + json.dumps(h, ensure_ascii=False)[:800]
+        )
+    spec_url = root.rstrip("/") + "/openapi.json"
+    spec = _http_get_json(spec_url, timeout=5)
+    if isinstance(spec, dict) and _openapi_post_requires_query_request(spec):
+        raise RuntimeError(
+            "根据 "
+            + spec_url
+            + "：当前 "
+            + root
+            + " 上的 POST /v1/chat/completions 在 OpenAPI 中要求 URL 查询参数 request，"
+            "不是本仓库 serve_gemma4_4bit（应使用 JSON body 的 messages）。\n"
+            "因此会出现 HTTP 422（detail 含 query、request）。\n\n"
+            "说明：浏览器里 /health 若仍像 Gemma，多半是同一端口上另有程序或代理把路径「嫁接」了；\n"
+            "请 netstat -ano | findstr :"
+            + port_hint
+            + " 结束错误 PID，并只启动本项目的 SERVE_GEMMA4_4BIT.bat（新版默认监听 18090）。\n"
+            "然后把「本地对话」URL 改成 http://127.0.0.1:18090/v1 再试。"
+        )
+
+
+def local_openai_compatible_chat_round(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    prior: list[tuple[str, str, list[Path]]],
+    user_text: str,
+    user_images: list[Path],
+    temperature: float = 0.0,
+    top_p: float = 0.82,
+    timeout_sec: int = 240,
+    stream: bool = False,
+    on_delta: Callable[[str], None] | None = None,
+) -> tuple[str, str]:
+    """
+    面向本地 / OpenAI 兼容服务的多轮对话；支持每轮用户侧附带多张图片（vision）。
+    prior 每项为 (用户文本, 助手回复, 该轮用户消息中的图片路径列表)。
+    stream=True 时使用 SSE；on_delta 在收到增量时调用（通常在后台线程，由调用方自行切回 UI 线程）。
+    """
+    b = _normalize_openai_v1_base(base_url)
+    url = b.rstrip("/") + "/chat/completions"
+    _assert_loopback_serve_gemma_preflight(url, client_model=model)
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    for ut, at, imgs in prior:
+        try:
+            ucontent = _openai_user_content_parts(ut, imgs)
+        except ValueError:
+            ucontent = (ut or "").strip() or "."
+        messages.append({"role": "user", "content": ucontent})
+        messages.append({"role": "assistant", "content": at})
+    tail = _openai_user_content_parts(user_text, user_images)
+    messages.append({"role": "user", "content": tail})
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": 8192,
+    }
+    _k = (api_key or "").strip()
+    headers: dict[str, str] | None = None
+    if _k and _k.upper() != "EMPTY":
+        headers = {"Authorization": f"Bearer {_k}"}
+    if stream:
+        text = _http_post_openai_chat_sse_deltas(
+            url, payload, headers, timeout=timeout_sec, on_delta=on_delta
+        )
+        if not text:
+            raise RuntimeError("OpenAI-compatible 流式返回空正文")
+        return text, model
+    out = _http_post_json(url, payload, headers, timeout=timeout_sec)
+    try:
+        raw = out["choices"][0]["message"]["content"]
+        text = _parse_assistant_openai_content(raw)
     except (KeyError, IndexError, TypeError) as e:
         raise RuntimeError(f"OpenAI-compatible 解析失败: {e!s}") from e
     if not text:
@@ -409,12 +930,46 @@ def _anthropic_generate(api_key: str, model: str, system: str, user: str) -> tup
     return text, model
 
 
+def _anthropic_user_blocks(text: str, images: list[Path]) -> str | list:
+    if not images:
+        return text
+    blocks: list[dict] = []
+    t = (text or "").strip()
+    if t:
+        blocks.append({"type": "text", "text": t})
+    for p in images:
+        try:
+            if not p.is_file():
+                continue
+            raw = p.read_bytes()
+            if len(raw) > 15 * 1024 * 1024:
+                continue
+            b64 = base64.standard_b64encode(raw).decode("ascii")
+            mime = _guess_image_mime(p)
+            if not str(mime).startswith("image/"):
+                mime = "image/jpeg"
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": b64},
+                }
+            )
+        except OSError:
+            continue
+    if not blocks:
+        return (text or "").strip() or "."
+    return blocks
+
+
 def _anthropic_multiturn(
     api_key: str,
     model: str,
     system: str,
-    prior_turns: list[tuple[str, str]],
+    prior_turns: list[tuple[str, str, bool]],
     user_payload: str,
+    *,
+    attach_vision_current: bool,
+    vision_paths: list[Path] | None = None,
 ) -> tuple[str, str]:
     url = "https://api.anthropic.com/v1/messages"
     headers = {
@@ -422,11 +977,14 @@ def _anthropic_multiturn(
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
+    imgs0 = list(vision_paths or [])
     messages: list[dict] = []
-    for u, a in prior_turns:
-        messages.append({"role": "user", "content": u})
+    for u, a, att in prior_turns:
+        uimgs = imgs0 if att else []
+        messages.append({"role": "user", "content": _anthropic_user_blocks(u, uimgs)})
         messages.append({"role": "assistant", "content": a})
-    messages.append({"role": "user", "content": user_payload})
+    last_imgs = imgs0 if attach_vision_current else []
+    messages.append({"role": "user", "content": _anthropic_user_blocks(user_payload, last_imgs)})
     payload = {
         "model": model,
         "max_tokens": 8192,
@@ -434,8 +992,13 @@ def _anthropic_multiturn(
         "system": system,
         "messages": messages,
     }
+    to = (
+        300
+        if imgs0 and (attach_vision_current or any(t[2] for t in prior_turns))
+        else 120
+    )
     try:
-        out = _http_post_json(url, payload, headers, timeout=120)
+        out = _http_post_json(url, payload, headers, timeout=to)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Anthropic HTTP {e.code}: {body[:1200]}") from e
@@ -443,6 +1006,25 @@ def _anthropic_multiturn(
     if not text:
         raise RuntimeError("Anthropic 返回空正文")
     return text, model
+
+
+def _chat_system_with_vision(base: str, vision_paths: list[Path]) -> str:
+    if not vision_paths:
+        return base
+    return (
+        base
+        + "\n\n【多模态·硬性要求】本请求的用户消息在 API 中与文字一并包含多张 JPEG（视频代表帧，来自画面管线）。"
+        "你必须根据这些图像中的像素内容回答颜色、物体、界面、字幕条等可见信息；"
+        "禁止声称「无法访问图片」「仅有合并文稿/报告文本」「没有视频画面权限」——除非某一细节在图上确实看不清，再如实说明。\n"
+        "图像与文字节选矛盾时，以图像为准并简短点明。"
+    )
+
+
+def _vision_user_preamble() -> str:
+    return (
+        "【给助手】本条 HTTP 请求里，本条用户消息除下列文字外还包含多张 JPEG 图像（视频截帧）。"
+        "请直接依据图像回答（含颜色、形状、界面文字）；不要说你只能看合并文稿或看不到图。\n\n"
+    )
 
 
 def _build_chat_intro(merged_text: str, analysis_excerpt: str | None) -> str:
@@ -469,33 +1051,58 @@ def chat_followup(
     user_message: str,
     *,
     analysis_excerpt: str | None = None,
-    prior_turns: list[tuple[str, str]],
+    prior_turns: Sequence[tuple[str, str] | tuple[str, str, bool]],
+    attach_vision_current: bool = False,
+    vision_frame_paths: Sequence[Path] | None = None,
 ) -> tuple[str, str, str]:
     """
-    多轮对话的单次请求。prior_turns 为已完成的 (发给 API 的用户原文, 助手回复) 列表。
+    多轮对话的单次请求。prior_turns 每项为 (用户原文, 助手回复) 或 (用户原文, 助手回复, 该轮是否附带画面帧)。
+    attach_vision_current：为 True 时在本轮用户消息上附带 vision_frame_paths。
     返回 (助手正文, 模型标签, 本轮实际提交给 API 的用户文本)。
     """
     q = user_message.strip()
     if not q:
         raise ValueError("请输入问题后再发送。")
     intro = _build_chat_intro(merged_transcript, analysis_excerpt)
-    prior = list(prior_turns)
+    prior = normalize_chat_prior_turns(prior_turns)
     if not prior:
         user_payload = intro + "\n【用户问题】\n" + q
     else:
         user_payload = q
 
+    vpaths = list(vision_frame_paths) if vision_frame_paths else []
+    if attach_vision_current and vpaths:
+        user_payload = _vision_user_preamble() + user_payload
+    using_vision = bool(vpaths) and (attach_vision_current or any(t[2] for t in prior))
+    sys_chat = (
+        _chat_system_with_vision(SYSTEM_CHAT_ZH, vpaths) if using_vision else SYSTEM_CHAT_ZH
+    )
+
     if provider == "gemini":
         key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not key:
             raise RuntimeError("未设置环境变量 GEMINI_API_KEY")
-        text, model = _gemini_multiturn(key, SYSTEM_CHAT_ZH, prior, user_payload)
+        text, model = _gemini_multiturn(
+            key,
+            sys_chat,
+            prior,
+            user_payload,
+            attach_vision_current=attach_vision_current,
+            vision_paths=vpaths or None,
+        )
         return text, f"Gemini / {model}", user_payload
     if provider == "groq":
         key = os.environ.get("GROQ_API_KEY", "").strip()
         if not key:
             raise RuntimeError("未设置环境变量 GROQ_API_KEY")
-        text, model = _groq_multiturn(key, SYSTEM_CHAT_ZH, prior, user_payload)
+        text, model = _groq_multiturn(
+            key,
+            sys_chat,
+            prior,
+            user_payload,
+            attach_vision_current=attach_vision_current,
+            vision_paths=vpaths or None,
+        )
         return text, f"Groq / {model}", user_payload
     if provider == "openai":
         key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -504,7 +1111,14 @@ def chat_followup(
         base = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
         model = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
         text, used = _openai_compatible_multiturn(
-            key, base, model, SYSTEM_CHAT_ZH, prior, user_payload
+            key,
+            base,
+            model,
+            sys_chat,
+            prior,
+            user_payload,
+            attach_vision_current=attach_vision_current,
+            vision_paths=vpaths or None,
         )
         return text, f"OpenAI / {used}", user_payload
     if provider == "xai":
@@ -514,7 +1128,14 @@ def chat_followup(
         base = "https://api.x.ai/v1"
         model = (os.environ.get("XAI_MODEL") or "grok-2-latest").strip()
         text, used = _openai_compatible_multiturn(
-            key, base, model, SYSTEM_CHAT_ZH, prior, user_payload
+            key,
+            base,
+            model,
+            sys_chat,
+            prior,
+            user_payload,
+            attach_vision_current=attach_vision_current,
+            vision_paths=vpaths or None,
         )
         return text, f"xAI Grok / {used}", user_payload
     if provider == "anthropic":
@@ -523,7 +1144,13 @@ def chat_followup(
             raise RuntimeError("未设置环境变量 ANTHROPIC_API_KEY")
         model = (os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-haiku-20241022").strip()
         text, used = _anthropic_multiturn(
-            key, model, SYSTEM_CHAT_ZH, prior, user_payload
+            key,
+            model,
+            sys_chat,
+            prior,
+            user_payload,
+            attach_vision_current=attach_vision_current,
+            vision_paths=vpaths or None,
         )
         return text, f"Anthropic / {used}", user_payload
     raise RuntimeError(f"不支持的 provider：{provider!r}")

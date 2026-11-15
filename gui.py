@@ -8,9 +8,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 import tkinter as tk
 import tkinter.font as tkfont
@@ -23,7 +26,14 @@ _pw_browsers = ROOT / "pw-browsers"
 if _pw_browsers.is_dir():
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_pw_browsers.resolve()))
 sys.path.insert(0, str(ROOT))
-from llm_analyze import chat_followup, resolve_provider
+from llm_analyze import (
+    MAX_LOCAL_CHAT_MERGED_SNIPPET,
+    SYSTEM_LOCAL_CHAT_ZH,
+    chat_followup,
+    collect_timeline_frame_paths,
+    local_openai_compatible_chat_round,
+    resolve_provider,
+)
 from transcribe_local import (
     SUPPORTED_LOCAL_MEDIA_SUFFIXES,
     WHISPER_MODEL_CHOICES,
@@ -112,6 +122,55 @@ def _pick_sans_cjk(root: tk.Misc) -> str:
 OUT = ROOT / "out"
 MERGED = OUT / "transcript_merged.txt"
 ANALYSIS = OUT / "video_analysis.txt"
+ANALYSIS_DEEP_JSON = OUT / "video_analysis_deep.json"
+LOCAL_CHAT_ROOT = ROOT / "local_chat_data"
+# 「本地对话」默认指向 Vision 副本中 SERVE_GEMMA4_4BIT.bat 的监听地址（非 LM Studio 的 1234）
+DEFAULT_LOCAL_OPENAI_BASE = "http://127.0.0.1:18090/v1"
+DEFAULT_LOCAL_OPENAI_MODEL_ID = "gemma-4-31b-4bit"
+
+
+def _maybe_rewrite_lm_studio_local_url(url: str | None) -> str:
+    """空串保持空；经典 LM Studio 默认 1234 → 本项目 Gemma 18090。"""
+    u = (url if url is not None else "").strip()
+    if not u:
+        return ""
+    low = u.rstrip("/").lower()
+    if low in ("http://127.0.0.1:1234/v1", "http://localhost:1234/v1"):
+        return DEFAULT_LOCAL_OPENAI_BASE
+    return u
+
+
+def _local_openai_base_for_ui(stored: str | None) -> str:
+    """偏好/输入框：空或上述 LM 默认 → Gemma 默认。"""
+    return _maybe_rewrite_lm_studio_local_url(stored) or DEFAULT_LOCAL_OPENAI_BASE
+
+
+def _migrate_local_llm_prefs_json() -> None:
+    try:
+        if not LLM_GUI_PREF_JSON.is_file():
+            return
+        raw = json.loads(LLM_GUI_PREF_JSON.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        changed = False
+        for key in ("local_inf_autofill_url", "chat_local_base_url"):
+            if key not in raw:
+                continue
+            old = raw.get(key)
+            if not isinstance(old, str):
+                continue
+            new = _local_openai_base_for_ui(old)
+            if new != old:
+                raw[key] = new
+                changed = True
+        if changed:
+            LLM_GUI_PREF_JSON.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+
 
 LLM_PROVIDER_COMBO_VALUES = ("auto", "gemini", "openai", "groq", "anthropic", "xai")
 _LLM_PROVIDER_SET = frozenset(LLM_PROVIDER_COMBO_VALUES)
@@ -416,6 +475,7 @@ def _analysis_report_bottom_pane_minsize(
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        _migrate_local_llm_prefs_json()
         self.title("本地与 B 站 · 转写与分析")
         self.configure(bg=T_BG)
 
@@ -507,6 +567,7 @@ class App(tk.Tk):
         nav_item("task", "提取与日志")
         nav_item("merged", "合并文稿")
         nav_item("report", "分析报告")
+        nav_item("local_chat", "本地对话")
         nav_item("api", "API 与模型")
 
         tk.Frame(main, bg=NAV_DIVIDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
@@ -522,15 +583,23 @@ class App(tk.Tk):
         self.frame_task = ttk.Frame(self._content_host, padding=0)
         self.frame_merged = ttk.Frame(self._content_host, padding=0)
         self.frame_report = ttk.Frame(self._content_host, padding=0)
+        self.frame_local_chat = ttk.Frame(self._content_host, padding=0)
         self.frame_api = ttk.Frame(self._content_host, padding=0)
 
-        for f in (self.frame_task, self.frame_merged, self.frame_report, self.frame_api):
+        for f in (
+            self.frame_task,
+            self.frame_merged,
+            self.frame_report,
+            self.frame_local_chat,
+            self.frame_api,
+        ):
             f.grid(row=0, column=0, sticky="nsew")
 
         self._views = {
             "task": self.frame_task,
             "merged": self.frame_merged,
             "report": self.frame_report,
+            "local_chat": self.frame_local_chat,
             "api": self.frame_api,
         }
 
@@ -698,6 +767,9 @@ class App(tk.Tk):
 
         self._build_api_settings_page(inner)
 
+        self._local_chat_hub = LocalChatHub(self.frame_local_chat, self)
+        self._local_chat_hub.pack(fill=tk.BOTH, expand=True)
+
         self._busy = False
         self._show_view("task")
         entry.focus_set()
@@ -714,10 +786,13 @@ class App(tk.Tk):
         self._llm_xai_key = tk.StringVar(value=g("XAI_API_KEY", ""))
         self._llm_gemini_model = tk.StringVar(value=g("GEMINI_MODEL", ""))
         self._llm_openai_model = tk.StringVar(value=g("OPENAI_MODEL", ""))
-        self._llm_openai_base = tk.StringVar(value=g("OPENAI_BASE_URL", ""))
+        self._llm_openai_base = tk.StringVar(
+            value=_maybe_rewrite_lm_studio_local_url(g("OPENAI_BASE_URL", ""))
+        )
         self._llm_groq_model = tk.StringVar(value=g("GROQ_MODEL", ""))
         self._llm_anthropic_model = tk.StringVar(value=g("ANTHROPIC_MODEL", ""))
         self._llm_xai_model = tk.StringVar(value=g("XAI_MODEL", ""))
+        self.report_chat_attach_vision_var = tk.BooleanVar(value=False)
 
     def _sync_llm_env_from_form(self) -> None:
         def push(name: str, val: str) -> None:
@@ -1140,6 +1215,11 @@ class App(tk.Tk):
             bg = NAV_ACTIVE if k == key else NAV_BG
             row.configure(bg=bg)
             self._nav_labels[k].configure(bg=bg)
+        if key == "local_chat":
+            try:
+                self._local_chat_hub.on_tab_visible()
+            except tk.TclError:
+                pass
 
     def _setup_fonts_and_styles(self) -> str:
         """返回主操作按钮的 ttk style 名。"""
@@ -1404,13 +1484,1287 @@ class App(tk.Tk):
             )
 
 
+def _resolve_ollama_executable() -> str | None:
+    """PATH + Windows 常见安装目录（从资源管理器启动 GUI 时 PATH 往往不含 Ollama）。"""
+    for name in ("ollama", "ollama.exe"):
+        w = shutil.which(name)
+        if w:
+            return w
+    if sys.platform != "win32":
+        return None
+    la = os.environ.get("LOCALAPPDATA", "").strip()
+    pf = os.environ.get("ProgramFiles", "").strip()
+    pfx86 = os.environ.get("ProgramFiles(x86)", "").strip()
+    for base in (
+        Path(la) / "Programs" / "Ollama" if la else None,
+        Path(pf) / "Ollama" if pf else None,
+        Path(pfx86) / "Ollama" if pfx86 else None,
+    ):
+        if base is None:
+            continue
+        for exe in ("ollama.exe", "Ollama.exe"):
+            cand = base / exe
+            try:
+                if cand.is_file():
+                    return str(cand)
+            except OSError:
+                pass
+    return None
+
+
+class LocalInferenceServerPanel(ttk.Frame):
+    """在「本地对话」页内启动本机推理进程（如 ollama），显示输出并可选回填服务 URL。"""
+
+    _PRESET_OLLAMA = "ollama"
+    _PRESET_LMSTUDIO = "lmstudio"
+    _PRESET_CUSTOM = "custom"
+    _OLLAMA_BASE = "http://127.0.0.1:11434/v1"
+
+    def __init__(self, parent: tk.Misc, chat_hub: object) -> None:
+        super().__init__(parent)
+        self._chat_hub = chat_hub
+
+        self._proc: subprocess.Popen | None = None
+        pre = self._load_prefs()
+        self._preset_var = tk.StringVar(value=str(pre.get("local_inf_preset") or self._PRESET_OLLAMA))
+        self._exe_var = tk.StringVar(value=str(pre.get("local_inf_exe") or ""))
+        self._args_var = tk.StringVar(value=str(pre.get("local_inf_args") or ""))
+        self._cwd_var = tk.StringVar(value=str(pre.get("local_inf_cwd") or ""))
+        self._autofill_var = tk.BooleanVar(value=bool(pre.get("local_inf_autofill", True)))
+        self._autofill_url_var = tk.StringVar(
+            value=_local_openai_base_for_ui(str(pre.get("local_inf_autofill_url") or ""))
+        )
+
+        app = chat_hub._app
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text="在此启动的子进程日志会显示在下方。切换回「对话」标签不会停止服务；关闭主程序时子进程将结束。",
+            wraplength=700,
+            foreground=T_MUTED,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        pf = ttk.LabelFrame(outer, text="方式", padding=(8, 6))
+        pf.pack(fill=tk.X, pady=(0, 8))
+        for val, label in (
+            (self._PRESET_OLLAMA, "Ollama：执行 ollama serve（API 一般为 http://127.0.0.1:11434/v1）"),
+            (self._PRESET_LMSTUDIO, "仅打开 LM Studio（需在软件内点击 Start Server）"),
+            (self._PRESET_CUSTOM, "自定义：可执行文件 + 参数（如 llama-server、其他 OpenAI 兼容服务）"),
+        ):
+            ttk.Radiobutton(
+                pf, text=label, value=val, variable=self._preset_var, command=self._sync_preset_ui
+            ).pack(anchor=tk.W, pady=2)
+
+        self._custom_fr = ttk.Frame(outer)
+        r1 = ttk.Frame(self._custom_fr)
+        r1.pack(fill=tk.X)
+        ttk.Label(r1, text="程序", width=8).pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self._exe_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Button(r1, text="浏览…", command=self._browse_exe, width=8).pack(side=tk.LEFT)
+        r2 = ttk.Frame(self._custom_fr)
+        r2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(r2, text="参数").pack(side=tk.LEFT)
+        ttk.Entry(r2, textvariable=self._args_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        r3 = ttk.Frame(self._custom_fr)
+        r3.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(r3, text="工作目录").pack(side=tk.LEFT)
+        ttk.Entry(r3, textvariable=self._cwd_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        af = ttk.Frame(outer)
+        af.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(
+            af, text="启动成功后写入「本地对话」页的服务 URL", variable=self._autofill_var
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            af,
+            text=(
+                "自定义 URL（仅「自定义」预设使用；Ollama 固定 11434/v1；"
+                "Gemma 4-bit 默认同 Vision 副本：18090/v1）"
+            ),
+            foreground=T_MUTED,
+        ).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Entry(af, textvariable=self._autofill_url_var).pack(fill=tk.X, pady=(2, 0))
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill=tk.X, pady=(0, 8))
+        self._btn_start = ttk.Button(bar, text="启动", command=self._start)
+        self._btn_start.pack(side=tk.LEFT, padx=(0, 8))
+        self._btn_stop = ttk.Button(bar, text="停止", command=self._stop, state=tk.DISABLED)
+        self._btn_stop.pack(side=tk.LEFT)
+        self._status = ttk.Label(bar, text="未运行")
+        self._status.pack(side=tk.LEFT, padx=(16, 0))
+
+        log_fr = ttk.Frame(outer)
+        log_fr.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(log_fr, text="进程输出").pack(anchor=tk.W)
+        sb = ttk.Scrollbar(log_fr)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._log = tk.Text(
+            log_fr,
+            height=14,
+            wrap=tk.WORD,
+            font=app._font_log,
+            bg=T_PANEL,
+            fg=T_TEXT,
+            relief="flat",
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground=T_BORDER,
+        )
+        self._log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.configure(command=self._log.yview)
+        self._log.configure(yscrollcommand=sb.set)
+        bind_text_mousewheel(self._log, lines_per_notch=app._text_wheel_lines)
+
+        self._sync_preset_ui()
+        self.bind("<Destroy>", self._on_panel_destroy)
+
+    def _on_panel_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
+        self._save_prefs()
+
+    def _load_prefs(self) -> dict:
+        try:
+            if LLM_GUI_PREF_JSON.is_file():
+                raw = json.loads(LLM_GUI_PREF_JSON.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    return raw
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return {}
+
+    def _save_prefs(self) -> None:
+        m = self._load_prefs()
+        m.update(
+            {
+                "local_inf_preset": self._preset_var.get(),
+                "local_inf_exe": self._exe_var.get().strip(),
+                "local_inf_args": self._args_var.get().strip(),
+                "local_inf_cwd": self._cwd_var.get().strip(),
+                "local_inf_autofill": self._autofill_var.get(),
+                "local_inf_autofill_url": self._autofill_url_var.get().strip(),
+            }
+        )
+        try:
+            LLM_GUI_PREF_JSON.write_text(
+                json.dumps(m, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def _sync_preset_ui(self) -> None:
+        p = self._preset_var.get()
+        if p == self._PRESET_CUSTOM:
+            self._custom_fr.pack(fill=tk.X, pady=(0, 6))
+        else:
+            self._custom_fr.pack_forget()
+
+    def _browse_exe(self) -> None:
+        p = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(),
+            title="选择可执行文件",
+            filetypes=[("可执行文件", "*.exe;*.bat;*.cmd"), ("全部", "*.*")],
+        )
+        if p:
+            self._exe_var.set(p)
+
+    def _log_line(self, s: str) -> None:
+        try:
+            self._log.insert(tk.END, s)
+            self._log.see(tk.END)
+        except tk.TclError:
+            pass
+
+    def _set_status(self, t: str) -> None:
+        try:
+            self._status.configure(text=t)
+        except tk.TclError:
+            pass
+
+    def _launch_lm_studio(self) -> None:
+        cands = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "LM Studio" / "LM Studio.exe",
+            Path(os.environ.get("ProgramFiles", "")) / "LM Studio" / "LM Studio.exe",
+            Path(os.environ.get("ProgramFiles(x86)", "")) / "LM Studio" / "LM Studio.exe",
+        ]
+        for p in cands:
+            if p.is_file():
+                try:
+                    subprocess.Popen([str(p)], cwd=str(p.parent))
+                except OSError as e:
+                    messagebox.showerror("失败", str(e), parent=self.winfo_toplevel())
+                    return
+                self._log_line(
+                    f"[gui] 已启动 LM Studio：{p}\n请在软件内开启 Local Server，再把地址填到「服务 URL」。\n"
+                )
+                self._set_status("已打开 LM Studio")
+                return
+        messagebox.showinfo(
+            "未找到",
+            "未在常见安装路径找到 LM Studio.exe。请手动打开 LM Studio，或改用 Ollama / 自定义。",
+            parent=self.winfo_toplevel(),
+        )
+
+    def _start(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            messagebox.showinfo(
+                "提示", "当前已有进程在运行，请先停止。", parent=self.winfo_toplevel()
+            )
+            return
+        preset = self._preset_var.get()
+        cmd: list[str]
+        cwd: str | None = None
+        if preset == self._PRESET_OLLAMA:
+            exe = _resolve_ollama_executable()
+            if not exe:
+                messagebox.showerror(
+                    "未找到 ollama",
+                    "未在系统 PATH 及常见安装目录中找到 ollama.exe。\n"
+                    "若已安装 Ollama，可改用「自定义」：程序选 ollama.exe，参数填 serve。\n"
+                    "安装见 https://ollama.com",
+                    parent=self.winfo_toplevel(),
+                )
+                return
+            cmd = [exe, "serve"]
+        elif preset == self._PRESET_LMSTUDIO:
+            self._save_prefs()
+            self._launch_lm_studio()
+            return
+        else:
+            exe = self._exe_var.get().strip().strip('"')
+            if not exe:
+                messagebox.showwarning(
+                    "提示", "请填写可执行文件路径。", parent=self.winfo_toplevel()
+                )
+                return
+            if not Path(exe).is_file():
+                messagebox.showwarning(
+                    "提示", f"找不到文件：{exe}", parent=self.winfo_toplevel()
+                )
+                return
+            arg_s = self._args_var.get().strip()
+            try:
+                parts = shlex.split(arg_s, posix=(os.name != "nt")) if arg_s else []
+            except ValueError as e:
+                messagebox.showerror(
+                    "参数解析失败", str(e), parent=self.winfo_toplevel()
+                )
+                return
+            cmd = [exe] + parts
+            cw = self._cwd_var.get().strip()
+            if cw:
+                if not Path(cw).is_dir():
+                    messagebox.showwarning(
+                        "提示", f"工作目录无效：{cw}", parent=self.winfo_toplevel()
+                    )
+                    return
+                cwd = cw
+
+        self._save_prefs()
+        kw: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+        }
+        if cwd:
+            kw["cwd"] = cwd
+        if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            self._proc = subprocess.Popen(cmd, **kw)
+        except OSError as e:
+            messagebox.showerror("启动失败", str(e), parent=self.winfo_toplevel())
+            return
+
+        threading.Thread(target=self._drain_stdout, daemon=True).start()
+        self._btn_stop.configure(state=tk.NORMAL)
+        self._btn_start.configure(state=tk.DISABLED)
+        self._set_status(f"运行中 · PID {self._proc.pid}")
+        self._log_line("[gui] 已启动: " + " ".join(cmd) + "\n")
+        if self._autofill_var.get():
+            if preset == self._PRESET_OLLAMA:
+                url = self._OLLAMA_BASE
+            else:
+                url = self._autofill_url_var.get().strip().rstrip("/")
+            if url:
+
+                def _apply(u: str = url) -> None:
+                    self._chat_hub._loc_base.set(u)
+
+                self.after(500, _apply)
+
+    def _drain_stdout(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stdout:
+            return
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace")
+
+                def _append(t: str = text) -> None:
+                    self._log_line(t)
+
+                self.after(0, _append)
+        finally:
+            self.after(0, self._on_proc_finished)
+
+    def _on_proc_finished(self) -> None:
+        code = None
+        if self._proc is not None:
+            code = self._proc.poll()
+        self._proc = None
+        try:
+            self._btn_stop.configure(state=tk.DISABLED)
+            self._btn_start.configure(state=tk.NORMAL)
+        except tk.TclError:
+            pass
+        self._set_status("未运行" if code is None else f"已退出 · 代码 {code}")
+        self._log_line(f"\n[gui] 进程已结束，返回码 {code}\n")
+
+    def _stop(self) -> None:
+        if self._proc is None or self._proc.poll() is not None:
+            return
+        try:
+            self._proc.terminate()
+        except OSError:
+            pass
+        try:
+            if self._proc:
+                self._proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            try:
+                if self._proc:
+                    self._proc.kill()
+            except OSError:
+                pass
+
+
+class LocalChatHub(ttk.Frame):
+    """本地 OpenAI 兼容对话：侧栏会话历史、多轮记忆、图片附件，风格贴近网页聊天。"""
+
+    def __init__(self, parent: tk.Misc, app: App) -> None:
+        super().__init__(parent)
+        self._app = app
+        self._busy = False
+        self._current_sid: str | None = None
+        self._meta: dict = {}
+        self._pending_names: list[str] = []
+        self._lb_ids: list[str] = []
+        self._typing_row: tk.Frame | None = None
+        self._wrap_labels: list[tuple[tk.Misc, str]] = []
+        self._title_var = tk.StringVar(value="新对话")
+        self._include_merged = tk.BooleanVar(value=False)
+        self._loc_base = tk.StringVar(value="")
+        self._loc_model = tk.StringVar(value="")
+        self._loc_key = tk.StringVar(value="")
+        self._loc_stream = tk.BooleanVar(value=True)
+        self._stream_pending = ""
+        self._stream_after_id: str | None = None
+        self._stream_body: tk.Text | None = None
+
+        fam, sz = app._font_content[0], int(round(app._font_content[1]))
+        self._font_small = (fam, max(8, sz - 1))
+
+        top_nb = ttk.Notebook(self)
+        top_nb.pack(fill=tk.BOTH, expand=True)
+        tab_chat = ttk.Frame(top_nb, padding=0)
+        tab_srv = ttk.Frame(top_nb, padding=0)
+        top_nb.add(tab_chat, text=" 对话 ")
+        top_nb.add(tab_srv, text=" 本机推理服务 ")
+        self._local_hub_nb = top_nb
+        LocalInferenceServerPanel(tab_srv, chat_hub=self).pack(
+            fill=tk.BOTH, expand=True, padx=0, pady=0
+        )
+
+        shell = tk.Frame(tab_chat, bg=T_PAGE)
+        shell.pack(fill=tk.BOTH, expand=True)
+        left = tk.Frame(shell, bg=NAV_BG, width=int(236 * min(app._geom_scale, 1.35)))
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+        right = tk.Frame(shell, bg=T_PAGE)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right_body = tk.Frame(right, bg=T_PAGE)
+        right_body.pack(fill=tk.BOTH, expand=True, padx=(10, 16), pady=(10, 12))
+        pv = ttk.Panedwindow(right_body, orient=tk.VERTICAL)
+        pv.pack(fill=tk.BOTH, expand=True)
+        settings_pane = tk.Frame(pv, bg=T_PAGE)
+        chat_stack = tk.Frame(pv, bg=T_PAGE)
+        chat_stack.grid_rowconfigure(0, weight=1)
+        chat_stack.grid_columnconfigure(0, weight=1)
+        pv.add(settings_pane, weight=0)
+        pv.add(chat_stack, weight=1)
+
+        tk.Label(
+            left,
+            text="会话",
+            font=(app._font_ui[0], max(8, int(round(9 * app._font_soft))), "bold"),
+            bg=NAV_BG,
+            fg=T_MUTED,
+        ).pack(anchor=tk.W, padx=12, pady=(14, 6))
+        nb_row = tk.Frame(left, bg=NAV_BG)
+        nb_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(nb_row, text="＋ 新对话", command=self._new_session).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(nb_row, text="删除", command=self._delete_current, width=6).pack(
+            side=tk.LEFT
+        )
+        lb_fr = tk.Frame(left, bg=NAV_BG)
+        lb_fr.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 12))
+        sb_l = tk.Scrollbar(
+            lb_fr,
+            orient=tk.VERTICAL,
+            width=app._scrollbar_px,
+            troughcolor=SCROLL_TROUGH,
+        )
+        self._listbox = tk.Listbox(
+            lb_fr,
+            activestyle="dotbox",
+            bg=NAV_ACTIVE,
+            fg=T_TEXT,
+            selectbackground=T_SELECT,
+            highlightthickness=0,
+            borderwidth=0,
+            font=app._font_ui,
+        )
+        self._listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb_l.pack(side=tk.RIGHT, fill=tk.Y)
+        self._listbox.configure(yscrollcommand=sb_l.set)
+        sb_l.configure(command=self._listbox.yview)
+        self._listbox.bind("<<ListboxSelect>>", self._on_sidebar_select)
+
+        head = tk.Frame(settings_pane, bg=T_PAGE)
+        head.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(head, text="标题", bg=T_PAGE, fg=T_MUTED, font=self._font_small).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
+        ttk.Entry(head, textvariable=self._title_var, width=36).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        self._title_var.trace_add("write", lambda *_: self._debounced_save_title())
+
+        api_row = ttk.Frame(settings_pane, padding=(0, 0, 0, 4))
+        api_row.pack(fill=tk.X)
+        row_gap = max(8, int(round(10 * app._font_soft)))
+        ttk.Label(api_row, text="服务 URL（须含 /v1）").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(api_row, textvariable=self._loc_base, width=52).grid(
+            row=0, column=1, sticky="ew", padx=(10, 0)
+        )
+        ttk.Label(api_row, text="模型 ID").grid(row=1, column=0, sticky=tk.W, pady=(row_gap, 0))
+        ttk.Entry(api_row, textvariable=self._loc_model, width=28).grid(
+            row=1, column=1, sticky="ew", padx=(10, 0), pady=(row_gap, 0)
+        )
+        ttk.Label(api_row, text="API Key").grid(row=2, column=0, sticky=tk.W, pady=(row_gap, 0))
+        ttk.Entry(api_row, textvariable=self._loc_key, width=36, show="•").grid(
+            row=2, column=1, sticky="ew", padx=(10, 0), pady=(row_gap, 0)
+        )
+        api_row.columnconfigure(1, weight=1)
+        ttk.Label(
+            settings_pane,
+            text=(
+                f"Gemma 4-bit（Vision 目录 SERVE_GEMMA4_4BIT.bat）：URL {DEFAULT_LOCAL_OPENAI_BASE} ，"
+                f"模型 {DEFAULT_LOCAL_OPENAI_MODEL_ID}"
+            ),
+            font=self._font_small,
+            foreground=T_MUTED,
+            wraplength=int(min(920, 520 + 220 * app._geom_scale)),
+        ).pack(anchor=tk.W, pady=(2, 4))
+        srv_row = ttk.Frame(settings_pane)
+        srv_row.pack(fill=tk.X, pady=(max(4, row_gap // 2), 0))
+        ttk.Button(
+            srv_row,
+            text="切换到「本机推理服务」标签…",
+            command=self._show_local_inference_tab,
+        ).pack(anchor=tk.W)
+        hint_pt = max(8, min(10, int(round(8 * app._font_soft))))
+        ttk.Label(
+            settings_pane,
+            text="与网页版类似：左侧切换历史；点「＋」贴图；记忆含本会话多轮，可选附带合并文稿。",
+            font=(app._font_ui[0], hint_pt),
+            foreground=T_MUTED,
+            wraplength=int(min(920, 520 + 220 * app._geom_scale)),
+        ).pack(anchor=tk.W, pady=(8, 8))
+
+        opt_row = tk.Frame(settings_pane, bg=T_PAGE)
+        opt_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Checkbutton(
+            opt_row,
+            text="附带 out/transcript_merged.txt 作背景（长上下文，适合追问视频）",
+            variable=self._include_merged,
+        ).pack(anchor=tk.W)
+        ttk.Checkbutton(
+            opt_row,
+            text="流式输出（SSE，Vision 目录 Gemma serve 支持；其它服务若报错请取消勾选）",
+            variable=self._loc_stream,
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        chat_row = tk.Frame(chat_stack, bg=T_PAGE)
+        chat_row.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        chat_row.grid_rowconfigure(0, weight=1)
+        chat_row.grid_columnconfigure(0, weight=1)
+        y_inc = max(18, int(round(app._font_content[1] * 2.4)))
+        self._chat_canvas = tk.Canvas(
+            chat_row,
+            bg=T_SURFACE,
+            highlightthickness=0,
+            borderwidth=0,
+            yscrollincrement=y_inc,
+        )
+        sb = tk.Scrollbar(
+            chat_row,
+            command=self._chat_canvas.yview,
+            width=app._scrollbar_px,
+            troughcolor=SCROLL_TROUGH,
+        )
+        self._chat_canvas.configure(yscrollcommand=sb.set)
+        self._msgs = tk.Frame(self._chat_canvas, bg=T_SURFACE)
+        self._msg_win = self._chat_canvas.create_window((0, 0), window=self._msgs, anchor="nw")
+
+        def _sync(_e: object | None = None) -> None:
+            self._chat_canvas.configure(scrollregion=self._chat_canvas.bbox("all"))
+
+        def _on_cv_cfg(event: tk.Misc) -> None:
+            w = int(getattr(event, "width", 0) or 0)
+            if w > 8:
+                self._chat_canvas.itemconfigure(self._msg_win, width=w)
+                self._refresh_bubble_wrap(w)
+
+        self._msgs.bind("<Configure>", lambda e: _sync())
+        self._chat_canvas.bind("<Configure>", _on_cv_cfg)
+        for w in (self._chat_canvas, self._msgs):
+            w.bind("<MouseWheel>", self._on_chat_wheel)
+            w.bind("<Button-4>", self._on_chat_wheel)
+            w.bind("<Button-5>", self._on_chat_wheel)
+        self._chat_canvas.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        comp_outer = tk.Frame(chat_stack, bg=T_PAGE)
+        comp_outer.grid(row=1, column=0, sticky="ew")
+        self._composer = tk.Frame(
+            comp_outer,
+            bg=A_COMPOSER,
+            highlightbackground=A_CARD_BORDER,
+            highlightthickness=1,
+        )
+        self._composer.pack(fill=tk.X, ipadx=2, ipady=2)
+        top_c = tk.Frame(self._composer, bg=A_COMPOSER)
+        top_c.pack(fill=tk.X, padx=6, pady=(8, 4))
+        ttk.Button(top_c, text="＋", width=3, command=self._pick_images).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self._inp = tk.Text(
+            top_c,
+            height=4,
+            wrap=tk.WORD,
+            font=app._font_content,
+            padx=10,
+            pady=8,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            bg=A_COMPOSER,
+            fg=A_TEXT,
+            insertbackground=A_TEXT,
+        )
+        self._inp.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        bind_text_mousewheel(self._inp, lines_per_notch=app._text_wheel_lines)
+        self._attach_lbl = tk.Label(
+            self._composer,
+            text="",
+            font=self._font_small,
+            bg=A_COMPOSER,
+            fg=A_META,
+            anchor=tk.W,
+        )
+        self._attach_lbl.pack(fill=tk.X, padx=12, pady=(0, 4))
+        bot_c = tk.Frame(self._composer, bg=A_COMPOSER)
+        bot_c.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._status = tk.Label(
+            bot_c,
+            text="Ctrl+Enter 发送 · 图片将复制到会话目录",
+            font=self._font_small,
+            bg=A_COMPOSER,
+            fg=A_META,
+        )
+        self._status.pack(side=tk.LEFT)
+        ttk.Button(bot_c, text="清除附件", command=self._clear_pending).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(
+            bot_c,
+            text="发送",
+            command=self._on_send,
+            style=app._run_button_style,
+            width=8,
+        ).pack(side=tk.RIGHT)
+        self._inp.bind("<Control-Return>", self._on_ctrl_enter)
+
+        self._title_save_after: str | None = None
+
+    def _show_local_inference_tab(self) -> None:
+        try:
+            self._local_hub_nb.select(1)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def on_tab_visible(self) -> None:
+        self._sync_api_fields_from_app()
+        self._refresh_sidebar()
+
+    def _sync_api_fields_from_app(self) -> None:
+        if not self._loc_base.get().strip():
+            self._loc_base.set(
+                _local_openai_base_for_ui(self._app._llm_openai_base.get().strip() or None)
+            )
+        else:
+            cur = self._loc_base.get().strip()
+            nxt = _maybe_rewrite_lm_studio_local_url(cur) or cur
+            if nxt != cur:
+                self._loc_base.set(nxt)
+        if not self._loc_model.get().strip():
+            self._loc_model.set(
+                (self._app._llm_openai_model.get() or DEFAULT_LOCAL_OPENAI_MODEL_ID).strip()
+            )
+        if not self._loc_key.get().strip():
+            self._loc_key.set(self._app._llm_openai_key.get().strip())
+
+    def _debounced_save_title(self) -> None:
+        if self._title_save_after:
+            try:
+                self._app.after_cancel(self._title_save_after)
+            except tk.TclError:
+                pass
+        self._title_save_after = self._app.after(
+            400, lambda: self._flush_title_to_meta()
+        )
+
+    def _flush_title_to_meta(self) -> None:
+        self._title_save_after = None
+        if not self._current_sid:
+            return
+        try:
+            self._meta["title"] = self._title_var.get().strip() or "对话"
+            self._save_meta()
+            self._refresh_sidebar()
+        except (OSError, TypeError, KeyError):
+            pass
+
+    def _session_dir(self, sid: str) -> Path:
+        return LOCAL_CHAT_ROOT / sid
+
+    def _meta_path(self, sid: str) -> Path:
+        return self._session_dir(sid) / "meta.json"
+
+    def _files_dir(self, sid: str) -> Path:
+        return self._session_dir(sid) / "files"
+
+    def _list_session_ids(self) -> list[str]:
+        LOCAL_CHAT_ROOT.mkdir(parents=True, exist_ok=True)
+        rows: list[tuple[str, str]] = []
+        for p in LOCAL_CHAT_ROOT.iterdir():
+            if not p.is_dir():
+                continue
+            mp = p / "meta.json"
+            if not mp.is_file():
+                continue
+            try:
+                m = json.loads(mp.read_text(encoding="utf-8"))
+                rows.append((str(m.get("updated") or ""), p.name))
+            except (OSError, json.JSONDecodeError):
+                rows.append(("", p.name))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        return [r[1] for r in rows]
+
+    def _refresh_sidebar(self) -> None:
+        self._lb_ids = self._list_session_ids()
+        self._listbox.delete(0, tk.END)
+        for sid in self._lb_ids:
+            try:
+                m = json.loads(self._meta_path(sid).read_text(encoding="utf-8"))
+                title = str(m.get("title") or sid)[:48]
+            except (OSError, json.JSONDecodeError):
+                title = sid
+            self._listbox.insert(tk.END, title)
+        if self._current_sid and self._current_sid in self._lb_ids:
+            idx = self._lb_ids.index(self._current_sid)
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+
+    def _select_sid_in_list(self, sid: str) -> None:
+        if sid in self._lb_ids:
+            idx = self._lb_ids.index(sid)
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+
+    def _on_sidebar_select(self, _event: object) -> None:
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        i = int(sel[0])
+        if 0 <= i < len(self._lb_ids):
+            self._load_session(self._lb_ids[i])
+
+    def _new_session(self) -> None:
+        sid = uuid.uuid4().hex[:12]
+        d = self._session_dir(sid)
+        d.mkdir(parents=True, exist_ok=True)
+        self._files_dir(sid).mkdir(exist_ok=True)
+        self._meta = {
+            "id": sid,
+            "title": "新对话",
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "include_merged": False,
+            "turns": [],
+        }
+        self._meta_path(sid).write_text(
+            json.dumps(self._meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self._current_sid = sid
+        self._title_var.set("新对话")
+        self._include_merged.set(False)
+        self._pending_names.clear()
+        self._clear_chat_surface()
+        self._refresh_sidebar()
+        self._select_sid_in_list(sid)
+
+    def _load_session(self, sid: str) -> None:
+        try:
+            self._meta = json.loads(self._meta_path(sid).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            messagebox.showerror("错误", "无法读取会话文件。")
+            return
+        self._current_sid = sid
+        self._title_var.set(str(self._meta.get("title") or "对话"))
+        self._include_merged.set(bool(self._meta.get("include_merged")))
+        self._pending_names.clear()
+        self._clear_chat_surface()
+        for t in self._meta.get("turns") or []:
+            imgs = t.get("imgs") or []
+            self._add_user_bubble(str(t.get("u") or ""), [str(x) for x in imgs])
+            self._add_assistant_bubble(str(t.get("a") or ""))
+        self._scroll_bottom()
+
+    def _save_meta(self) -> None:
+        if not self._current_sid:
+            return
+        self._meta["id"] = self._current_sid
+        self._meta["title"] = self._title_var.get().strip() or "对话"
+        self._meta["include_merged"] = bool(self._include_merged.get())
+        self._meta["updated"] = datetime.now().isoformat(timespec="seconds")
+        self._meta.setdefault("turns", [])
+        self._meta_path(self._current_sid).write_text(
+            json.dumps(self._meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _ensure_session(self) -> str:
+        if self._current_sid and self._meta_path(self._current_sid).is_file():
+            return self._current_sid
+        self._new_session()
+        return self._current_sid or ""
+
+    def _delete_current(self) -> None:
+        if not self._current_sid:
+            messagebox.showinfo("提示", "请先选择一个会话。")
+            return
+        if not messagebox.askyesno("确认", "删除当前会话及其中的附件图片？"):
+            return
+        shutil.rmtree(self._session_dir(self._current_sid), ignore_errors=True)
+        self._current_sid = None
+        self._meta = {}
+        self._pending_names.clear()
+        self._clear_chat_surface()
+        self._title_var.set("新对话")
+        self._refresh_sidebar()
+
+    def _clear_chat_surface(self) -> None:
+        self._hide_typing()
+        self._wrap_labels.clear()
+        for w in self._msgs.winfo_children():
+            w.destroy()
+
+    def _clear_pending(self) -> None:
+        self._pending_names.clear()
+        self._refresh_attach_label()
+
+    def _refresh_attach_label(self) -> None:
+        if self._pending_names:
+            self._attach_lbl.configure(
+                text="已选附件：" + "、".join(self._pending_names[:8])
+                + (" …" if len(self._pending_names) > 8 else "")
+            )
+        else:
+            self._attach_lbl.configure(text="")
+
+    def _pick_images(self) -> None:
+        paths = filedialog.askopenfilenames(
+            parent=self._app,
+            title="选择图片",
+            filetypes=[
+                ("图片", "*.png *.jpg *.jpeg *.webp *.gif *.bmp"),
+                ("全部", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        sid = self._ensure_session()
+        fd = self._files_dir(sid)
+        fd.mkdir(parents=True, exist_ok=True)
+        for src in paths:
+            sp = Path(src)
+            if not sp.is_file():
+                continue
+            ext = sp.suffix.lower() or ".png"
+            dest = fd / f"img_{uuid.uuid4().hex[:10]}{ext}"
+            try:
+                shutil.copy2(sp, dest)
+                self._pending_names.append(dest.name)
+            except OSError as e:
+                messagebox.showerror("复制失败", str(e))
+        self._refresh_attach_label()
+
+    def _bubble_dims(self, canvas_w: int) -> tuple[int, int]:
+        wu = max(200, int((canvas_w - 72) * 0.70))
+        wa = max(240, int((canvas_w - 40) * 0.92))
+        return wu, wa
+
+    def _chars_for_wrap(self, px: int) -> int:
+        f = tkfont.Font(font=self._app._font_content)
+        w = max(f.measure("测"), f.measure("W"), 6)
+        return max(12, int(px // w))
+
+    def _bubble_text(
+        self,
+        parent: tk.Misc,
+        content: str,
+        *,
+        bg: str,
+        wrap_px: int,
+    ) -> tk.Text:
+        chars = self._chars_for_wrap(wrap_px)
+        t = tk.Text(
+            parent,
+            wrap=tk.WORD,
+            width=chars,
+            height=1,
+            font=self._app._font_content,
+            bg=bg,
+            fg=A_TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=2,
+            pady=4,
+            cursor="xterm",
+            undo=False,
+            maxundo=0,
+        )
+        t.insert("1.0", (content.strip() or "\u00a0"))
+        lines = int(t.index("end-1c").split(".")[0])
+        t.configure(height=max(1, lines))
+
+        def on_key(event: tk.Event) -> str | None:
+            st = int(getattr(event, "state", 0) or 0)
+            sym = (event.keysym or "").lower()
+            if st & 0x4 and sym in ("a", "c"):
+                return None
+            return "break"
+
+        t.bind("<Key>", on_key, add=True)
+        t.bind("<<Paste>>", lambda _e: "break", add=True)
+        return t
+
+    def _refresh_bubble_wrap(self, canvas_w: int) -> None:
+        wu, wa = self._bubble_dims(canvas_w)
+        for w, role in self._wrap_labels:
+            if isinstance(w, tk.Text):
+                px = wu if role == "user" else wa
+                w.configure(width=self._chars_for_wrap(px))
+                try:
+                    lines = int(w.index("end-1c").split(".")[0])
+                    w.configure(height=max(1, lines))
+                except tk.TclError:
+                    pass
+
+    def _on_chat_wheel(self, event: tk.Event) -> None:
+        if _widget_under_ancestor(getattr(event, "widget", None), self._composer):
+            return
+        lines = self._app._text_wheel_lines
+        d = getattr(event, "delta", 0) or 0
+        if d:
+            steps = int(-d * lines / 120.0) if sys.platform == "win32" else int(-d * lines / 120.0)
+            if steps == 0:
+                steps = -lines if d > 0 else lines
+            if steps:
+                self._chat_canvas.yview_scroll(steps, "units")
+            return
+        n = getattr(event, "num", 0)
+        if n == 4:
+            self._chat_canvas.yview_scroll(-lines, "units")
+        elif n == 5:
+            self._chat_canvas.yview_scroll(lines, "units")
+
+    def _scroll_bottom(self) -> None:
+        self.update_idletasks()
+        self._chat_canvas.configure(scrollregion=self._chat_canvas.bbox("all"))
+        self._chat_canvas.yview_moveto(1.0)
+
+    def _add_user_bubble(self, text: str, img_names: list[str]) -> None:
+        z = T_SURFACE
+        row = tk.Frame(self._msgs, bg=z)
+        row.pack(fill=tk.X, pady=(10, 2))
+        ts = datetime.now().strftime("%H:%M")
+        meta = tk.Frame(row, bg=z)
+        meta.pack(fill=tk.X, padx=(0, 12))
+        tk.Label(
+            meta,
+            text=f"You  ·  {ts}",
+            font=self._font_small,
+            bg=z,
+            fg=A_META,
+        ).pack(side=tk.RIGHT)
+        bubble = tk.Frame(row, bg=A_USER)
+        bubble.pack(anchor=tk.E, padx=(40, 8), pady=(2, 4))
+        cw = max(280, self._chat_canvas.winfo_width() or 320)
+        wu, _ = self._bubble_dims(cw)
+        body = self._bubble_text(bubble, text, bg=A_USER, wrap_px=wu)
+        body.pack(padx=12, pady=10, anchor=tk.W)
+        self._wrap_labels.append((body, "user"))
+        if img_names:
+            tk.Label(
+                bubble,
+                text="📎 " + "、".join(img_names[:6])
+                + (" …" if len(img_names) > 6 else ""),
+                font=self._font_small,
+                bg=A_USER,
+                fg=A_META,
+                anchor=tk.W,
+            ).pack(anchor=tk.W, padx=12, pady=(0, 8))
+        self._scroll_bottom()
+
+    def _add_assistant_bubble(self, text: str, *, error: bool = False) -> None:
+        z = T_SURFACE
+        row = tk.Frame(self._msgs, bg=z)
+        row.pack(fill=tk.X, pady=(10, 2))
+        tk.Label(
+            row,
+            text="Assistant",
+            font=self._font_small,
+            bg=z,
+            fg=A_META,
+        ).pack(anchor=tk.W, padx=(8, 0))
+        bg = A_ERR if error else A_CARD
+        border = "#fecaca" if error else A_CARD_BORDER
+        card = tk.Frame(row, bg=bg, highlightbackground=border, highlightthickness=1)
+        card.pack(anchor=tk.W, padx=(8, 12), pady=(4, 6), fill=tk.X)
+        cw = max(280, self._chat_canvas.winfo_width() or 320)
+        _, wa = self._bubble_dims(cw)
+        body = self._bubble_text(card, text, bg=bg, wrap_px=wa)
+        body.pack(padx=14, pady=12, anchor=tk.W, fill=tk.X)
+        self._wrap_labels.append((body, "assistant"))
+        self._scroll_bottom()
+
+    def _show_typing(self) -> None:
+        if self._typing_row is not None:
+            return
+        z = T_SURFACE
+        self._typing_row = tk.Frame(self._msgs, bg=z)
+        self._typing_row.pack(fill=tk.X, pady=(4, 8))
+        tk.Label(
+            self._typing_row,
+            text="正在回复…",
+            font=self._font_small,
+            bg=z,
+            fg=A_META,
+        ).pack(anchor=tk.W, padx=(12, 0))
+        self._scroll_bottom()
+
+    def _hide_typing(self) -> None:
+        if self._typing_row is not None:
+            self._typing_row.destroy()
+            self._typing_row = None
+
+    def _reset_stream_coalesce(self) -> None:
+        self._stream_pending = ""
+        self._stream_body = None
+        aid = self._stream_after_id
+        self._stream_after_id = None
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except tk.TclError:
+                pass
+
+    def _enqueue_stream_delta(self, body: tk.Text, chunk: str) -> None:
+        self._stream_body = body
+        self._stream_pending += chunk
+        if self._stream_after_id is None:
+            self._stream_after_id = self.after(
+                40, lambda b=body: self._flush_stream_pending(b)
+            )
+
+    def _flush_stream_pending(self, body: tk.Text) -> None:
+        self._stream_after_id = None
+        chunk = self._stream_pending
+        self._stream_pending = ""
+        if not chunk:
+            return
+        try:
+            cur = body.get("1.0", "end-1c")
+            if cur.strip() in ("", "\u00a0"):
+                body.delete("1.0", tk.END)
+            body.insert(tk.END, chunk)
+            lines = int(body.index("end-1c").split(".")[0])
+            body.configure(height=max(1, lines))
+            self._scroll_bottom()
+        except tk.TclError:
+            pass
+
+    def _flush_stream_delta_buffer(self) -> None:
+        b = self._stream_body
+        if b is not None and self._stream_pending:
+            self._flush_stream_pending(b)
+        self._stream_pending = ""
+        aid = self._stream_after_id
+        self._stream_after_id = None
+        if aid is not None:
+            try:
+                self.after_cancel(aid)
+            except tk.TclError:
+                pass
+
+    def _add_assistant_stream_shell(self) -> tk.Text:
+        z = T_SURFACE
+        row = tk.Frame(self._msgs, bg=z)
+        row.pack(fill=tk.X, pady=(10, 2))
+        tk.Label(
+            row,
+            text="Assistant",
+            font=self._font_small,
+            bg=z,
+            fg=A_META,
+        ).pack(anchor=tk.W, padx=(8, 0))
+        bg = A_CARD
+        card = tk.Frame(row, bg=bg, highlightbackground=A_CARD_BORDER, highlightthickness=1)
+        card.pack(anchor=tk.W, padx=(8, 12), pady=(4, 6), fill=tk.X)
+        cw = max(280, self._chat_canvas.winfo_width() or 320)
+        _, wa = self._bubble_dims(cw)
+        body = self._bubble_text(card, "\u00a0", bg=bg, wrap_px=wa)
+        body.pack(padx=14, pady=12, anchor=tk.W, fill=tk.X)
+        self._wrap_labels.append((body, "assistant"))
+        self._scroll_bottom()
+        return body
+
+    def _on_ctrl_enter(self, _event: object) -> str:
+        self._on_send()
+        return "break"
+
+    def _on_send(self) -> None:
+        if self._busy:
+            return
+        text = self._inp.get("1.0", tk.END).strip()
+        if not text and not self._pending_names:
+            return
+        base = self._loc_base.get().strip().rstrip("/")
+        model = self._loc_model.get().strip()
+        key = self._loc_key.get().strip() or "EMPTY"
+        if not base:
+            messagebox.showwarning(
+                "提示",
+                f"请填写服务根 URL（须含 /v1）。Gemma 本地默认同 Vision 副本：\n{DEFAULT_LOCAL_OPENAI_BASE}",
+            )
+            return
+        if not model:
+            messagebox.showwarning("提示", "请填写模型 ID（须与本地 serve 一致）。")
+            return
+        sid = self._ensure_session()
+        fd = self._files_dir(sid)
+        pending_paths = [fd / n for n in self._pending_names]
+        prior: list[tuple[str, str, list[Path]]] = []
+        for t in self._meta.get("turns") or []:
+            names = [str(x) for x in (t.get("imgs") or []) if x]
+            imgs = [fd / n for n in names]
+            prior.append((str(t.get("u") or ""), str(t.get("a") or ""), imgs))
+        sys_p = SYSTEM_LOCAL_CHAT_ZH
+        if self._include_merged.get() and MERGED.is_file():
+            body = MERGED.read_text(encoding="utf-8", errors="replace")
+            if len(body) > MAX_LOCAL_CHAT_MERGED_SNIPPET:
+                body = body[: MAX_LOCAL_CHAT_MERGED_SNIPPET] + "\n…（已截断）"
+            sys_p += "\n\n【背景：视频合并文稿（可选参考）】\n" + body
+        self._busy = True
+        self._add_user_bubble(text, list(self._pending_names))
+        self._inp.delete("1.0", tk.END)
+        self._pending_names.clear()
+        self._refresh_attach_label()
+        use_stream = bool(self._loc_stream.get())
+        stream_body: tk.Text | None = None
+        if use_stream:
+            stream_body = self._add_assistant_stream_shell()
+        else:
+            self._show_typing()
+        self._status.configure(text="请求中…")
+        for w in (self._inp,):
+            try:
+                w.configure(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+        threading.Thread(
+            target=self._worker_send,
+            args=(text, pending_paths, prior, base, key, model, sys_p, sid, use_stream, stream_body),
+            daemon=True,
+        ).start()
+
+    def _worker_send(
+        self,
+        text: str,
+        pending_paths: list[Path],
+        prior: list[tuple[str, str, list[Path]]],
+        base: str,
+        key: str,
+        model: str,
+        sys_p: str,
+        sid: str,
+        use_stream: bool,
+        stream_body: tk.Text | None,
+    ) -> None:
+        try:
+            names = [p.name for p in pending_paths if p.is_file()]
+            if use_stream and stream_body is not None:
+                def push(c: str) -> None:
+                    self._app.after(
+                        0, lambda c=c: self._enqueue_stream_delta(stream_body, c)
+                    )
+
+                reply, used = local_openai_compatible_chat_round(
+                    base_url=base,
+                    api_key=key,
+                    model=model,
+                    system_prompt=sys_p,
+                    prior=prior,
+                    user_text=text,
+                    user_images=pending_paths,
+                    stream=True,
+                    on_delta=push,
+                )
+                self._app.after(0, self._flush_stream_delta_buffer)
+                self._app.after(
+                    0,
+                    lambda: self._finish_ok(
+                        text, reply, used, names, sid, stream_bubble=stream_body
+                    ),
+                )
+            else:
+                reply, used = local_openai_compatible_chat_round(
+                    base_url=base,
+                    api_key=key,
+                    model=model,
+                    system_prompt=sys_p,
+                    prior=prior,
+                    user_text=text,
+                    user_images=pending_paths,
+                )
+                self._app.after(
+                    0,
+                    lambda: self._finish_ok(text, reply, used, names, sid),
+                )
+        except Exception as e:
+            self._app.after(
+                0,
+                lambda err=str(e), sb=stream_body: self._finish_err(err, stream_bubble=sb),
+            )
+
+    def _finish_ok(
+        self,
+        user_text: str,
+        reply: str,
+        used_model: str,
+        img_names: list[str],
+        sid: str,
+        *,
+        stream_bubble: tk.Text | None = None,
+    ) -> None:
+        self._reset_stream_coalesce()
+        self._busy = False
+        for w in (self._inp,):
+            try:
+                w.configure(state=tk.NORMAL)
+            except tk.TclError:
+                pass
+        self._hide_typing()
+        mp = self._meta_path(sid)
+        try:
+            disk = json.loads(mp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            disk = {"id": sid, "title": "对话", "turns": []}
+        disk.setdefault("turns", []).append(
+            {"u": user_text, "a": reply, "imgs": img_names}
+        )
+        disk["updated"] = datetime.now().isoformat(timespec="seconds")
+        turns = disk["turns"]
+        if len(turns) == 1 and str(disk.get("title") or "") in ("", "新对话"):
+            short = user_text.replace("\n", " ").strip()[:40]
+            if short:
+                disk["title"] = short + ("…" if len(user_text) > 40 else "")
+        try:
+            mp.write_text(
+                json.dumps(disk, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        if self._current_sid == sid:
+            if stream_bubble is None:
+                self._add_assistant_bubble(reply)
+            self._meta = disk
+            self._title_var.set(str(disk.get("title") or "对话"))
+            self._save_meta()
+            self._status.configure(text=f"就绪 · {used_model}")
+        else:
+            self._status.configure(
+                text=f"就绪 · {used_model}（已切换会话，回复已写入左侧对应历史）"
+            )
+        self._refresh_sidebar()
+
+    def _finish_err(self, err: str, *, stream_bubble: tk.Text | None = None) -> None:
+        self._reset_stream_coalesce()
+        self._busy = False
+        for w in (self._inp,):
+            try:
+                w.configure(state=tk.NORMAL)
+            except tk.TclError:
+                pass
+        self._hide_typing()
+        if stream_bubble is not None:
+            try:
+                stream_bubble.master.master.destroy()
+            except tk.TclError:
+                pass
+        self._add_assistant_bubble(err, error=True)
+        self._status.configure(text="出错 · 请检查 URL / 模型 / 服务是否支持 SSE 与 vision")
+
+
 class AgentSession:
     """分析报告底部对话区：单面板会话与 API 轮次。"""
 
     def __init__(self, app: App) -> None:
         self._app = app
         self._provider = resolve_provider(app.llm_provider_var.get().strip())
-        self._turns: list[tuple[str, str]] = []
+        self._turns: list[tuple[str, str, bool]] = []
         self._panels: list[AgentChatPanel] = []
         self._busy = False
 
@@ -1472,14 +2826,18 @@ class AgentSession:
             analysis = ""
             if ANALYSIS.is_file():
                 analysis = ANALYSIS.read_text(encoding="utf-8", errors="replace")
+            vision_paths = collect_timeline_frame_paths(ANALYSIS_DEEP_JSON)
+            attach_vis = bool(self._app.report_chat_attach_vision_var.get())
             reply, tag, payload = chat_followup(
                 self._provider,
                 merged,
                 user_visible,
                 analysis_excerpt=analysis or None,
                 prior_turns=self._turns,
+                attach_vision_current=attach_vis,
+                vision_frame_paths=vision_paths,
             )
-            self._turns.append((payload, reply))
+            self._turns.append((payload, reply, attach_vis))
             self._app.after(0, lambda r=reply, t=tag: self._finish_ok(r, t))
         except Exception as e:
             self._app.after(0, lambda err=str(e): self._finish_err(err))
@@ -1635,6 +2993,11 @@ class AgentChatPanel(tk.Frame):
             fg=A_META,
         )
         self._status.pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            bottom_bar,
+            text="本轮附带画面帧（不勾选则模型只看文字）",
+            variable=app.report_chat_attach_vision_var,
+        ).pack(side=tk.LEFT, padx=(10, 4))
         self._send_btn = ttk.Button(
             bottom_bar,
             text="发送",
